@@ -58,7 +58,9 @@ def build_intake_task(agent) -> Task:
             "occurrence. Never resolve to a date before today. If no "
             "duration was stated, default to 30 minutes. If no "
             "constraints were stated, set constraints to an empty "
-            "string."
+            "string. If the caller never stated a time (not even "
+            "vaguely, like 'afternoon'), set time to an empty string -- "
+            "do not guess or invent a time."
         ),
         expected_output="A ParsedRequest JSON object.",
         agent=agent,
@@ -113,6 +115,14 @@ class BookingFlow(Flow[BookingState]):
         # straight to attempting the booking.
         if self.state.raw_request:
             self._intake()
+            if not self.state.time:
+                # Refuse rather than guess -- ParsedRequest.time defaults
+                # to "" specifically so a missing time is distinguishable
+                # from an LLM-invented one. No point calling the
+                # Scheduler when we already know the request is
+                # incomplete.
+                self._finalize_missing_time()
+                return
         while True:
             self._attempt_booking()
             status = self.state.last_result.get("status")
@@ -233,6 +243,18 @@ class BookingFlow(Flow[BookingState]):
         self.state.time = proposal.chosen_time
 
     # ---- terminal states -------------------------------------------------
+
+    def _finalize_missing_time(self):
+        self.state.final_status = "failed"
+        self.state.log.append(
+            f"DONE: intake parsed date={self.state.date or 'unknown'} but no "
+            "time was stated; asking the caller to clarify instead of "
+            "guessing one."
+        )
+        if self.state.date:
+            self._notify(f"What time on {self.state.date} works for you?")
+        else:
+            self._notify("What date and time works for you?")
 
     def _finalize_success(self):
         self.state.final_status = "booked"

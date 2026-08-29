@@ -11,7 +11,11 @@ from pydantic import BaseModel, Field
 
 class ParsedRequest(BaseModel):
     date: str = Field(description="YYYY-MM-DD")
-    time: str = Field(description="HH:MM, 24-hour")
+    time: str = Field(
+        default="",
+        description="HH:MM, 24-hour, or an empty string if the caller "
+        "never stated a time -- never invent one.",
+    )
     duration_minutes: int = Field(default=30)
     title: str = Field(description="Short label for the booking")
     constraints: str = Field(
