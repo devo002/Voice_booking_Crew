@@ -1,0 +1,4 @@
+# Eval/test tooling only -- not needed to run the app itself.
+# pip install -r requirements.txt -r requirements-dev.txt
+pytest>=8.0.0
+deepeval>=1.0.0
