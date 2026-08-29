@@ -37,6 +37,7 @@ by editing this file. The Supabase backend persists normally.
 from __future__ import annotations
 
 import os
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -173,7 +174,25 @@ def cancel_booking(date: str, time: str, user_id: str | None = Depends(get_curre
 async def _run_flow(inputs: dict) -> dict:
     messages: list[str] = []
     flow = BookingFlow(notify=messages.append)
-    await flow.kickoff_async(inputs=inputs)
+    try:
+        await flow.kickoff_async(inputs=inputs)
+    except Exception:
+        # An unhandled exception here would otherwise reach the browser as
+        # a raw, non-JSON "Internal Server Error" -- fetch().json() then
+        # throws a confusing SyntaxError instead of showing anything
+        # useful. The full traceback still goes to the server log (Render's
+        # Logs tab) for debugging; the client only sees a clean, parseable
+        # failure.
+        traceback.print_exc()
+        return {
+            "status": "failed",
+            "date": "",
+            "time": "",
+            "title": "",
+            "attempts": 0,
+            "corrected": False,
+            "messages": ["Something went wrong on my end -- could you try again?"],
+        }
     return {
         "status": flow.state.final_status,
         "date": flow.state.date,
