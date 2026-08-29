@@ -109,6 +109,41 @@ idempotent (e.g. check-then-book keyed so a retry with identical
 arguments is a no-op) or move the guardrail's retry outside the
 side-effecting call entirely.
 
+### Missing required fields: refuse, don't invent
+
+`ParsedRequest.time` (`schemas.py`) used to be a required string with no
+default -- the Intake Agent had to put *something* there even when the
+caller never stated a time, despite its own backstory promising it would
+"never invent a date/time that wasn't stated." Confirmed empirically, not
+assumed: asking it to parse "book a dentist appointment next Tuesday"
+(no time at all) came back with `time: "09:00"`, invented from nothing.
+Worse, non-deterministically it could instead leave the field
+null/missing, which -- since there was no default -- raised an unhandled
+Pydantic `ValidationError` deep inside the flow, surfacing to the browser
+as a raw, non-JSON `"Internal Server Error"` (a `fetch().json()` parse
+failure, not a useful error message).
+
+Fix, in two parts:
+1. `time` now defaults to `""` (empty string = "not stated"), the same
+   convention `constraints` already used, plus an explicit prompt
+   instruction to leave it empty rather than guess -- not even from vague
+   signals like "afternoon".
+2. `BookingFlow.run()` checks for that right after intake and returns
+   early with `"What time on {date} works for you?"` -- before the
+   Scheduler is ever called, since there's no point attempting a booking
+   the request doesn't have enough information for yet.
+
+`date` has the identical latent gap (also required, also has no
+"caller never said" sentinel) and isn't fixed yet -- same fix pattern
+would apply if it turns out to matter in practice.
+
+Separately, `server.py`'s `_run_flow` now catches *any* unexpected
+exception from `BookingFlow.kickoff_async` (not just this one) and
+returns a clean JSON failure response instead of letting it crash out as
+that same unparseable plain-text 500 -- the full traceback still goes to
+the server log for debugging, but the caller always gets something the
+frontend can render, regardless of what actually broke.
+
 ### Why tool results are structured, not exceptions
 
 `booking_crew/mock_calendar.py`, `supabase_calendar.py`, and `tools.py`
@@ -326,10 +361,11 @@ harness (DeepEval). Open items, roughly in priority order:
    Postgres for due bookings is enough for a first version -- no Celery/
    Redis needed at this scale) plus an email/SMS delivery provider,
    since nothing currently sends anything on its own.
-3. **More failure types.** Only `conflict` and `date_in_past` are
-   currently correctable/terminal-with-a-specific-message. Ambiguous
-   dates from Intake could loop back to Intake with a clarifying question
-   instead of attempting a bogus booking.
+3. **More failure types.** `conflict`, `date_in_past`, and a missing
+   time are now handled with specific, correct responses. `date` has the
+   same "could get invented" gap `time` had (see Guardrails section) and
+   is the next candidate -- loop back to Intake with a clarifying
+   question instead of attempting a bogus booking.
 4. **Deploy.** Render is the intended host; needs the Supabase env vars
    set there and HTTPS (required for `MediaRecorder`/mic access outside
    `localhost` anyway).
