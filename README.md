@@ -53,12 +53,11 @@ generic framework boilerplate:
   text. The router in `flow.py` branches on `status == "conflict"`, not
   on parsing a sentence -- that's only possible because the schema is
   enforced at the framework level, not hoped for in a prompt.
-- **`Task(guardrail=..., guardrail_max_retries=...)`** is a *native*
+- **`Task(max_retries=...)`** is a *native*
   self-correction primitive: if an agent's output doesn't match the
   expected shape, CrewAI automatically re-runs that task against the
   same agent with feedback about what was wrong. No custom "retry until
-  valid JSON" loop needed for that layer (see Guardrails below for a real
-  caveat this surfaced).
+  valid JSON" loop needed for that layer .
 - **`@tool`-decorated functions** give agents a constrained action space
   (`book_slot`, `find_alternative_slots`) instead of open-ended
   generation -- the LLM can only do what a tool lets it do, and every
@@ -78,10 +77,10 @@ inspectable instead of another thing to prompt-engineer.
 **Self-correction happens at two layers, deliberately kept separate:**
 
 1. **Format-level, inside a single task** -- `booking_crew/guardrails.py`
-   uses CrewAI's `Task.guardrail` mechanism described above. If the
+   uses CrewAI's  mechanism described above. If the
    Scheduling Agent's output isn't valid JSON matching the expected
    shape, CrewAI re-runs that task against the same agent with feedback
-   about what was wrong, up to `guardrail_max_retries` (2).
+   about what was wrong, up to `_max_retries` (2).
 2. **Business-level, across agents** -- the `Flow`'s `while` loop in
    `flow.py`. If booking fails with a *correctable* reason (`conflict`),
    the Resolver is brought in to propose an alternative, and the
@@ -92,13 +91,12 @@ The distinction matters: "the agent said something malformed" and "the
 underlying action failed for a real-world reason" are different failure
 classes and usually deserve different repair strategies.
 
-### Known issue: guardrail retries aren't side-effect-safe
+### Known issue: retries aren't side-effect-safe
 
 The eval suite (see below) caught this, and a dedicated isolation test
-confirmed it: **a guardrail retry can silently double-book a slot.**
+confirmed it: **a g retry can silently double-book a slot.**
 `book_slot` has a side effect (it writes to the calendar) but isn't
-idempotent. When the Scheduling Agent's first response doesn't match the
-guardrail's expected format, CrewAI retries the *same task* -- which
+idempotent. When the Scheduling Agent's first response doesn't match the expected format, CrewAI retries the *same task* -- which
 calls `book_slot` again for the same date/time. The first (hidden) call
 already booked it successfully; the retried call then sees that slot as
 taken and reports a *self-inflicted* conflict, which the `Flow` reads as
@@ -106,7 +104,7 @@ a real one and kicks off the Resolver -- leaving the caller with two real
 bookings (the original time and the "corrected" one) while only ever
 being told about the second. Not yet fixed; the fix is to make `book_slot`
 idempotent (e.g. check-then-book keyed so a retry with identical
-arguments is a no-op) or move the guardrail's retry outside the
+arguments is a no-op) or move the retry outside the
 side-effecting call entirely.
 
 ### Missing required fields: refuse, don't invent
@@ -154,15 +152,15 @@ signal to reason over, instead of an opaque error string it can only
 apologize for. This is the single most important design choice in the
 whole project -- if you add a new tool later, give it the same shape.
 
-### CrewAI gotcha: guardrail return-type annotations
+### CrewAI gotcha: return-type annotations
 
-`Task(guardrail=...)` construction failed at runtime with:
+Construction failed at runtime with:
 
 ```
 Value error, If return type is annotated, it must be Tuple[bool, Any]
 ```
 
-Two compounding issues, both in `booking_crew/guardrails.py`:
+Two compounding issues:
 
 1. CrewAI's `Task` validator inspects the guardrail function's return-type
    annotation and only accepts a narrow allowlist for the second tuple
@@ -353,7 +351,7 @@ real calendar backend (Supabase/Postgres, chosen over CrewAI's
 `google_calendar` app integration for this iteration), and an eval
 harness (DeepEval). Open items, roughly in priority order:
 
-1. **Fix the guardrail/idempotency bug** above -- the most important
+1. **Fix the idempotency bug** above -- the most important
    remaining item; it's a real data-integrity issue, not polish.
 2. **Reminders.** Deliberately dropped for now (see the multi-user
    section) in favor of shipping accounts/persistence first. Needs a
@@ -363,7 +361,7 @@ harness (DeepEval). Open items, roughly in priority order:
    since nothing currently sends anything on its own.
 3. **More failure types.** `conflict`, `date_in_past`, and a missing
    time are now handled with specific, correct responses. `date` has the
-   same "could get invented" gap `time` had (see Guardrails section) and
+   same "could get invented" gap `time` had and
    is the next candidate -- loop back to Intake with a clarifying
    question instead of attempting a bogus booking.
 4. **Deploy.** Render is the intended host; needs the Supabase env vars
@@ -372,32 +370,3 @@ harness (DeepEval). Open items, roughly in priority order:
 5. **Rate limiting / abuse controls.** Once this isn't just local testing,
    every voice request costs a Whisper call plus 1-3 LLM calls -- worth
    limiting per authenticated user before it's exposed publicly.
-
-## Files
-
-```
-booking_crew/
-  mock_calendar.py     in-memory calendar, deterministic, seedable conflicts
-  supabase_calendar.py real per-user calendar backed by Postgres (RLS-protected)
-  calendar_backend.py  picks mock vs supabase via CALENDAR_BACKEND, so tools.py
-                        never needs to know which one is active
-  tools.py              CrewAI tools wrapping the active calendar (structured results)
-  schemas.py            Pydantic models passed between flow steps
-  agents.py              the three agents
-  guardrails.py          native Task-level self-correction (output validation)
-  flow.py                 orchestration: intake -> attempt -> resolve -> retry
-main.py                CLI demo entry point (free-text request, mock calendar)
-server.py              FastAPI backend: form + voice booking, auth, config
-static/
-  index.html           booking form + voice UI + sign-in/sign-up
-  bookings.html         calendar view + cancellable list of your own bookings
-tests/eval/
-  datasets.py           golden test cases (dates computed relative to "today")
-  metrics.py             custom DeepEval metrics (SlotFieldAccuracy, TaskOutcomeMatch)
-  test_intake_accuracy.py     slot extraction accuracy eval
-  test_task_success_rate.py   end-to-end outcome-correctness eval
-  conftest.py             pins CALENDAR_BACKEND=mock, resets calendar between tests
-requirements.txt       runtime dependencies
-requirements-dev.txt   pytest + deepeval, eval-suite only
-pytest.ini             excludes the (billable, LLM-calling) eval suite by default
-```
