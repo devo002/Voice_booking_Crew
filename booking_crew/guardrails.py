@@ -18,15 +18,29 @@ Both are "self-correction" -- they just operate at different layers:
 """
 
 import json
+import re
 from typing import Any
 
 from crewai.tasks.task_output import TaskOutput
 
 VALID_STATUSES = {"booked", "conflict", "error"}
 
+# LLMs habitually wrap JSON in ```json ... ``` fences even when told not to.
+# book_slot has already run (and mutated the calendar) by the time this
+# guardrail sees the output, so treating a fenced-but-otherwise-correct
+# answer as a hard failure is costly, not just cosmetic: CrewAI's retry
+# re-runs the whole task, which calls the non-idempotent book_slot tool
+# again and self-conflicts with the booking the first call already made.
+# Stripping the fence here avoids that retry in the common case instead of
+# only asking the agent more firmly not to add one.
+_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL)
+
 
 def booking_output_guardrail(output: TaskOutput) -> tuple[bool, Any]:
     raw = output.raw.strip()
+    fenced = _FENCE_RE.match(raw)
+    if fenced:
+        raw = fenced.group(1).strip()
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
