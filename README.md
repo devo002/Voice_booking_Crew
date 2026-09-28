@@ -121,147 +121,6 @@ Pydantic `ValidationError` deep inside the flow, surfacing to the browser
 as a raw, non-JSON `"Internal Server Error"` (a `fetch().json()` parse
 failure, not a useful error message).
 
-Fix, in two parts:
-1. `time` now defaults to `""` (empty string = "not stated"), the same
-   convention `constraints` already used, plus an explicit prompt
-   instruction to leave it empty rather than guess -- not even from vague
-   signals like "afternoon".
-2. `BookingFlow.run()` checks for that right after intake and returns
-   early with `"What time on {date} works for you?"` -- before the
-   Scheduler is ever called, since there's no point attempting a booking
-   the request doesn't have enough information for yet.
-
-`date` has the identical latent gap (also required, also has no
-"caller never said" sentinel) and isn't fixed yet -- same fix pattern
-would apply if it turns out to matter in practice.
-
-Separately, `server.py`'s `_run_flow` now catches *any* unexpected
-exception from `BookingFlow.kickoff_async` (not just this one) and
-returns a clean JSON failure response instead of letting it crash out as
-that same unparseable plain-text 500 -- the full traceback still goes to
-the server log for debugging, but the caller always gets something the
-frontend can render, regardless of what actually broke.
-
-### Why tool results are structured, not exceptions
-
-`booking_crew/mock_calendar.py`, `supabase_calendar.py`, and `tools.py`
-never raise on an ordinary business failure -- `book_slot` returns
-`{"status": "conflict", "reason": "slot_taken", "detail": "..."}`. That's
-what makes the failure *correctable* by an LLM: it has a machine-readable
-signal to reason over, instead of an opaque error string it can only
-apologize for. This is the single most important design choice in the
-whole project -- if you add a new tool later, give it the same shape.
-
-### CrewAI gotcha: return-type annotations
-
-Construction failed at runtime with:
-
-```
-Value error, If return type is annotated, it must be Tuple[bool, Any]
-```
-
-Two compounding issues:
-
-1. CrewAI's `Task` validator inspects the guardrail function's return-type
-   annotation and only accepts a narrow allowlist for the second tuple
-   element (`Any`, `str`, `TaskOutput`, or `str | TaskOutput`). The
-   function was annotated `-> tuple[bool, str | dict]` -- accurate to
-   what it actually returns, but `str | dict` isn't on that allowlist.
-2. The file also had `from __future__ import annotations` (PEP 563) at
-   the top, which makes Python store *all* annotations in that module as
-   plain strings rather than live type objects. CrewAI's validator reads
-   `inspect.signature(fn).return_annotation` directly without resolving
-   PEP 563 strings back into types, so even a compliant annotation would
-   have been unreadable to it as long as that import was present --
-   confirmed by checking `get_origin()` on the annotation before and
-   after removing it.
-
-Fix: loosened the annotation to `tuple[bool, Any]` (on CrewAI's
-allowlist) *and* removed `from __future__ import annotations`, so the
-annotation resolves to a real `tuple[bool, typing.Any]` at runtime
-instead of a string. Worth remembering before adding
-`from __future__ import annotations` to any other file that defines a
-`guardrail=` callable for a CrewAI `Task`.
-
-## Voice: Whisper, not the browser's Speech API
-
-The first voice implementation used the browser's built-in
-`SpeechRecognition` (`webkitSpeechRecognition`) -- free, and it streams
-transcription while you talk instead of waiting for a full recording.
-It was dropped for a real reason, not a hypothetical one: **that API
-isn't actually local** -- Chrome streams your audio to Google's own
-speech servers to do the transcription. In a network environment where
-that specific dependency was blocked, it failed with a bare, undebuggable
-`"network"` error, even though the app's own server was completely
-reachable.
-
-The fix was server-side transcription via OpenAI's Whisper API
-(`/api/book-voice` in `server.py`): the browser now just records raw
-audio (`MediaRecorder`) and uploads it, and Whisper transcribes it. This
-trades a small amount of latency (recording finishes before transcription
-starts, instead of overlapping) and a per-request API cost for not
-depending on an undocumented, third-party, browser-vendor-specific
-network path. It also means voice booking only needs the same kind of
-outbound HTTPS access the booking agents already use for their own LLM
-calls -- `OPENAI_API_KEY` is required for this regardless of which
-provider `MODEL` points at, since Anthropic has no transcription API.
-
-Text-to-speech (`SpeechSynthesis`) stayed client-side -- there's no
-equivalent reachability problem there, since it's speaking text the
-browser already has, not sending anything out.
-
-## Multi-user, persisted: Supabase
-
-`booking_crew/calendar_backend.py` is the single indirection point
-`tools.py` imports `CALENDAR` from, chosen by the `CALENDAR_BACKEND`
-env var:
-
-- **`mock`** (default) -- the original in-memory `MockCalendar`. No
-  setup, no network, single implicit user. What `main.py`'s CLI demo and
-  the eval suite use, so neither needs a Supabase project.
-- **`supabase`** -- `SupabaseCalendar`, backed by a real `bookings`
-  table in Postgres, scoped per-user. `server.py` requires a valid
-  Supabase session (`Authorization: Bearer <access_token>`) on every
-  booking endpoint when this is active; `static/index.html` handles
-  sign-up/sign-in via `supabase-js` and attaches the token to every
-  request.
-
-Neither `tools.py` nor the agents know or care which backend is active --
-both implementations expose the same four methods
-(`is_available`/`book`/`find_nearby_available`/`cancel`, plus
-`all_bookings`), which was the whole point of the original mock
-calendar's docstring ("swap this module out for a real API client
-later").
-
-**Per-user scoping without an LLM-controlled parameter.** CrewAI's
-`@tool`-decorated functions have a fixed signature the LLM fills in --
-there's no safe way to make "whose calendar" an LLM tool argument
-without risking a caller naming someone else's user id. Instead,
-`supabase_calendar.current_user_id` is a `contextvars.ContextVar` that
-`server.py` sets once per authenticated request (from the verified JWT,
-never from the LLM), and every calendar method reads it implicitly.
-CrewAI's flow runtime executes each step via
-`asyncio.to_thread(ctx.run, method, ...)` with a captured
-`contextvars.Context`, which is exactly the mechanism that makes
-contextvars propagate correctly into that worker thread -- confirmed
-empirically with a real two-user isolation test (see below), not
-assumed.
-
-**Row-Level Security is the actual enforcement boundary** on the
-`bookings` table (`auth.uid() = user_id`); the app's own queries use the
-service-role key, which bypasses RLS by design (the backend, not the end
-user, is the trusted caller talking to Postgres), so the explicit
-`current_user_id` filtering in `supabase_calendar.py` is what keeps one
-user's queries scoped to their own rows day to day. RLS is the backstop
-if that ever has a bug or a table is ever queried directly with the anon
-key from the browser.
-
-Verified end-to-end against a real project, not assumed: user A can book
-a slot; user B booking the *identical* date/time succeeds independently
-(no false cross-user conflict); user B cannot see or cancel user A's
-booking (empty list, 404 respectively); an unauthenticated request is
-rejected before touching any data.
-
 ## Eval suite
 
 `tests/eval/` uses DeepEval to check two independent things a change to a
@@ -353,8 +212,8 @@ harness (DeepEval). Open items, roughly in priority order:
 
 1. **Fix the idempotency bug** above -- the most important
    remaining item; it's a real data-integrity issue, not polish.
-2. **Reminders.** Deliberately dropped for now (see the multi-user
-   section) in favor of shipping accounts/persistence first. Needs a
+2. **Reminders.** Deliberately dropped for now in favor of shipping
+   accounts/persistence first. Needs a
    scheduled check (Render Cron Job hitting an endpoint that queries
    Postgres for due bookings is enough for a first version -- no Celery/
    Redis needed at this scale) plus an email/SMS delivery provider,
